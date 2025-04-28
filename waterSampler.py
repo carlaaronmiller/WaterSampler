@@ -4,18 +4,13 @@ import serial
 import re
 import subprocess
 import glob
+import sys
 
-#connection for depth request
-#TODO: check the values for watersampler config.
+
+#Connection for depth request
 master = mavutil.mavlink_connection('tcp:127.0.0.1:5777')
 
-#Figure out which serial port is streaming turbidity vs CT.
-#The CT port will have two numbers before linebreak while turb will have one.
-
-#Cockpit
-#General setup:
-#Config serial connections and cockpit.
-#ROV is 192.168.2.1?
+#Cockpit general setup:
 boot_time = time.time()
 ROVCp = mavutil.mavlink_connection('udpout:192.168.2.2:14570',source_system=1,source_component=1)
 
@@ -37,8 +32,6 @@ def getCTNums(serNum):
 	#Get a line from the sensor.
 	sensorLine = getSensorLine(serNum)
 	#Parse it for the the specific values in said line.
-	#AML Rhodamine implementation:
-	#PPBvalue,rawValue.
 	splitLine = sensorLine.split()
 	sensorNums = [None] * 2
 	sensorNums[0] = int(float(splitLine[0])*1e5) #Conductivity Value.
@@ -65,37 +58,73 @@ def getSensorLine(serNum):
 			serNum.reset_input_buffer()
 			serNum.reset_output_buffer()
 			return fullLine
+			
 
+#AML Turbidity implementation
 def getTurbVal(serNum):
 	#Get a line from the sensor.
 	sensorLine = getSensorLine(serNum)
 	#Parse it for the the specific values in said line.
-	#AML Turbidity implementation 
+ 
 	return int(float(sensorLine))
 
+#Helper function to check if any data is being transmitted accross the USB line.
+def waitForSensorResponse(ser, timeout=5):
+    #Wait for data from the sensor for up to timeout seconds.
+    ser.timeout = 0.5  # Read timeout (non-blocking)
+    start_time = time.time()
+    buffer = ''
 
-#SETUP: figureo out which serial port is connected to which AML.
+    while time.time() - start_time < timeout:
+        try:
+            line = ser.readline().decode('utf-8').strip()
+            if line:
+                return line
+        except Exception:
+            pass
+    return None  # No valid data received
 
+# SETUP: Figure out which serial port is connected to which AML
 serial_connections = []
-usb_devices = glob.glob('/dev/ttyUSB*')
+timeout = 10  # seconds
+start_time = time.time()
 
+usb_devices = []
+
+# Wait until USB devices are detected or timeout
+while time.time() - start_time < timeout:
+    usb_devices = glob.glob('/dev/ttyUSB*')
+    if usb_devices:
+        break
+    time.sleep(0.5)  # Check every 0.5 seconds
+
+if not usb_devices:
+    print("No USB devices detected after 10 seconds. Exiting.")
+    sys.exit(1)
+
+# Proceed if USB devices found
 for dev in usb_devices:
     try:
         ser = serial.Serial(dev, 9600)
         serial_connections.append(ser)
         print(f"Connected to {dev}")
-        if(getSensorLine(ser).find(" ")!=-1):
+
+        line = waitForSensorResponse(ser)
+
+        if line is None:
+            print(f"No data received from {dev} after 5 seconds. Closing.")
+            ser.close()
+            continue  # Skip this device
+
+        if line.find(" ") != -1:
             print("It's a CT sensor.")
             CTSerial = ser
-            
         else:
             print("It's not CT.")
             TurbSerial = ser
-            
+
     except serial.SerialException as e:
         print(f"Failed to connect to {dev}: {e}")
-
-
 
 
 #IMPROTANT: Need to ping the host first for the autopilot to accept the connection.
@@ -110,12 +139,11 @@ msg = ROVCp.recv_match()
 #Main function.
 #Send the depth reading to CP.
 while True:
-  #TODO: check which param to request BAR depth.
-  #Rhodamine sensor on serial 0, CT sensor on serial 1.
+
   CTVals = getCTNums(CTSerial)
   TurbVal = getTurbVal(TurbSerial)
 	
-	#Print values to the terminal.
+  #Print values to the terminal.
   print("Turb: ",TurbVal)
   print("CT: ",CTVals)
   sendCockpitValue(ROVCp,"Cond",CTVals[0])
