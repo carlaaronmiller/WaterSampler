@@ -1,19 +1,21 @@
 from pymavlink import mavutil
+from datetime import datetime
 import time
 import serial
 import re
 import subprocess
 import glob
 import sys
+from datetime import datetime
 
-
+# -------------------------------CONNECTION SET UP-------------------------------
 #Connection for depth request
 master = mavutil.mavlink_connection('tcp:127.0.0.1:5777')
-
 #Cockpit general setup:
 boot_time = time.time()
 ROVCp = mavutil.mavlink_connection('udpout:192.168.2.2:14570',source_system=1,source_component=1)
 
+# -------------------------------UTILITY FUNCTIONS-------------------------------
 #Function returns the most recent message of the designated msgType. 
 def getMessage(connection, msgType):
 	msg = None
@@ -31,11 +33,14 @@ def sendCockpitValue(dest,name,sensorValue):
 def getCTNums(serNum):
 	#Get a line from the sensor.
 	sensorLine = getSensorLine(serNum)
+	
 	#Parse it for the the specific values in said line.
 	splitLine = sensorLine.split()
 	sensorNums = [None] * 2
 	sensorNums[0] = int(float(splitLine[0])*1e5) #Conductivity Value.
+	writeToFile(splitLine[0],"Cond")
 	sensorNums[1] = int(float(splitLine[1])) #Temperature Value.
+	writeToFile(splitLine[1],"Temp")
 	return sensorNums
 
 
@@ -53,7 +58,7 @@ def getSensorLine(serNum):
 		line.append(b)
 		if b =='\n':
 			fullLine = ''.join(line)
-			print("Full line is: ",fullLine)
+			#print("Full line is: ",fullLine)
 			line = []
 			serNum.reset_input_buffer()
 			serNum.reset_output_buffer()
@@ -64,6 +69,7 @@ def getSensorLine(serNum):
 def getTurbVal(serNum):
 	#Get a line from the sensor.
 	sensorLine = getSensorLine(serNum)
+	writeToFile(sensorLine,"Turb")
 	#Parse it for the the specific values in said line.
  
 	return int(float(sensorLine))
@@ -84,7 +90,7 @@ def waitForSensorResponse(ser, timeout=5):
             pass
     return None  # No valid data received
 
-# SETUP: Figure out which serial port is connected to which AML
+# -------------------------------SENSOR SET UP-------------------------------
 serial_connections = []
 timeout = 10  # seconds
 start_time = time.time()
@@ -136,20 +142,31 @@ time.sleep(1)
 msg = ROVCp.recv_match()
 
 
-#Main function.
-#Send the depth reading to CP.
-while True:
+# -------------------------------SENSOR DATA LOGGING-------------------------------
+day = datetime.now()
+fileName= "/usr/blueos/userdata/sensorData/" + str(datetime.date(day))+".txt"
+textBackup = open(fileName, "a")
 
+
+def writeToFile(sensorData,dataType):
+  #Grab the current time and add it to the sensor line.
+  e = datetime.now()
+  messageString =str(time.time())+","+dataType+","+str(sensorData)
+  #Write contents to the backup textfile.
+  textBackup.write(messageString)
+  textBackup.write("\n")
+# -------------------------------MAIN FUNCTION-------------------------------
+while True:
   CTVals = getCTNums(CTSerial)
   TurbVal = getTurbVal(TurbSerial)
-	
+  writeToFile(getMessage(master,'SCALED_PRESSURE2').press_abs,"Bar-Depth")
+  writeToFile(getMessage(master,'SCALED_PRESSURE2').temperature,"Bar-Temp")
   #Print values to the terminal.
   print("Turb: ",TurbVal)
   print("CT: ",CTVals)
+  #Stream values to cockpit.
   sendCockpitValue(ROVCp,"Cond",CTVals[0])
   sendCockpitValue(ROVCp,"Temp",CTVals[1])
   sendCockpitValue(ROVCp,"Turb",TurbVal)
-  depth = getMessage(master,'SCALED_PRESSURE2')
-  print(depth.press_abs)
-  sendCockpitValue(ROVCp,"BarDepth",float(depth.press_abs))
+
   time.sleep(1)
