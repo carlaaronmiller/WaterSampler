@@ -43,7 +43,6 @@ def getCTNums(serNum):
 	writeToFile(splitLine[1],"Temp")
 	return sensorNums
 
-
 #Function to pull a line from the sensor attached from the argument serial number.
 def getSensorLine(serNum):
 	#Initalize an empty buffer and an empty string.
@@ -63,7 +62,6 @@ def getSensorLine(serNum):
 			serNum.reset_input_buffer()
 			serNum.reset_output_buffer()
 			return fullLine
-			
 
 #AML Turbidity implementation
 def getTurbVal(serNum):
@@ -71,24 +69,23 @@ def getTurbVal(serNum):
 	sensorLine = getSensorLine(serNum)
 	writeToFile(sensorLine,"Turb")
 	#Parse it for the the specific values in said line.
- 
 	return int(float(sensorLine))
 
 #Helper function to check if any data is being transmitted accross the USB line.
 def waitForSensorResponse(ser, timeout=5):
-    #Wait for data from the sensor for up to timeout seconds.
-    ser.timeout = 0.5  # Read timeout (non-blocking)
-    start_time = time.time()
-    buffer = ''
+	#Wait for data from the sensor for up to timeout seconds.
+	ser.timeout = 0.5  # Read timeout (non-blocking)
+	start_time = time.time()
+	buffer = ''
 
-    while time.time() - start_time < timeout:
-        try:
-            line = ser.readline().decode('utf-8').strip()
-            if line:
-                return line
-        except Exception:
-            pass
-    return None  # No valid data received
+	while time.time() - start_time < timeout:
+		try:
+			line = ser.readline().decode('utf-8').strip()
+			if line:
+				return line
+		except Exception:
+			pass
+	return None  # No valid data received
 
 # -------------------------------SENSOR SET UP-------------------------------
 serial_connections = []
@@ -99,39 +96,38 @@ usb_devices = []
 
 # Wait until USB devices are detected or timeout
 while time.time() - start_time < timeout:
-    usb_devices = glob.glob('/dev/ttyUSB*')
-    if usb_devices:
-        break
-    time.sleep(0.5)  # Check every 0.5 seconds
+	usb_devices = glob.glob('/dev/ttyUSB*')
+	if usb_devices:
+		break
+	time.sleep(0.5)  # Check every 0.5 seconds
 
 if not usb_devices:
-    print("No USB devices detected after 10 seconds. Exiting.")
-    sys.exit(1)
+	print("No USB devices detected after 10 seconds. Exiting.")
+	sys.exit(1)
 
 # Proceed if USB devices found
 for dev in usb_devices:
-    try:
-        ser = serial.Serial(dev, 9600)
-        serial_connections.append(ser)
-        print(f"Connected to {dev}")
+	try:
+		ser = serial.Serial(dev, 9600)
+		serial_connections.append(ser)
+		print(f"Connected to {dev}")
 
-        line = waitForSensorResponse(ser)
+		line = waitForSensorResponse(ser)
 
-        if line is None:
-            print(f"No data received from {dev} after 5 seconds. Closing.")
-            ser.close()
-            continue  # Skip this device
+		if line is None:
+			print(f"No data received from {dev} after 5 seconds. Closing.")
+			ser.close()
+			continue  # Skip this device
 
-        if line.find(" ") != -1:
-            print("It's a CT sensor.")
-            CTSerial = ser
-        else:
-            print("It's not CT.")
-            TurbSerial = ser
+		if line.find(" ") != -1:
+			print("It's a CT sensor.")
+			CTSerial = ser
+		else:
+			print("It's not CT.")
+			TurbSerial = ser
 
-    except serial.SerialException as e:
-        print(f"Failed to connect to {dev}: {e}")
-
+	except serial.SerialException as e:
+		print(f"Failed to connect to {dev}: {e}")
 
 #IMPROTANT: Need to ping the host first for the autopilot to accept the connection.
 #Conversion of time unit for timestamping.
@@ -141,32 +137,31 @@ time.sleep(1)
 #Wait for acknowledgement.
 msg = ROVCp.recv_match()
 
-
 # -------------------------------SENSOR DATA LOGGING-------------------------------
 day = datetime.now()
 fileName= "/usr/blueos/userdata/sensorData/" + str(datetime.date(day))+".txt"
 textBackup = open(fileName, "a")
 
-
 def writeToFile(sensorData,dataType):
-  #Grab the current time and add it to the sensor line.
-  e = datetime.now()
-  messageString =str(time.time())+","+dataType+","+str(sensorData)
-  #Write contents to the backup textfile.
-  textBackup.write(messageString)
-  textBackup.write("\n")
+	#Grab the current time and add it to the sensor line.
+	e = datetime.now()
+	messageString =str(time.time())+","+dataType+","+str(sensorData)
+	#Write contents to the backup textfile.
+	textBackup.write(messageString)
+	textBackup.write("\n")
+
 # -------------------------------MAIN FUNCTION-------------------------------
 while True:
-  CTVals = getCTNums(CTSerial)
-  TurbVal = getTurbVal(TurbSerial)
-  writeToFile(getMessage(master,'SCALED_PRESSURE2').press_abs,"Bar-Depth")
-  writeToFile(getMessage(master,'SCALED_PRESSURE2').temperature,"Bar-Temp")
-  #Print values to the terminal.
-  print("Turb: ",TurbVal)
-  print("CT: ",CTVals)
-  #Stream values to cockpit.
-  sendCockpitValue(ROVCp,"Cond",CTVals[0])
-  sendCockpitValue(ROVCp,"Temp",CTVals[1])
-  sendCockpitValue(ROVCp,"Turb",TurbVal)
+	CTVals = getCTNums(CTSerial)
+	TurbVal = getTurbVal(TurbSerial)
+	writeToFile(getMessage(master,'SCALED_PRESSURE2').press_abs,"Bar-Depth")
+	writeToFile(getMessage(master,'SCALED_PRESSURE2').temperature,"Bar-Temp")
+	#Print values to the terminal.
+	print("Turb: ",TurbVal)
+	print("CT: ",CTVals)
+	#Stream values to cockpit.
+	sendCockpitValue(ROVCp,"Cond",CTVals[0])
+	sendCockpitValue(ROVCp,"Temp",CTVals[1])
+	sendCockpitValue(ROVCp,"Turb",TurbVal)
 
-  time.sleep(1)
+	time.sleep(1)
