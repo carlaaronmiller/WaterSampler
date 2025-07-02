@@ -1,167 +1,173 @@
 from pymavlink import mavutil
 from datetime import datetime
+from SPfromCPython import SPfromC
 import time
 import serial
-import re
-import subprocess
 import glob
 import sys
-from datetime import datetime
 
-# -------------------------------CONNECTION SET UP-------------------------------
-#Connection for depth request
+# -------------------------------CONNECTION SETUP-------------------------------
 master = mavutil.mavlink_connection('tcp:127.0.0.1:5777')
-#Cockpit general setup:
 boot_time = time.time()
-ROVCp = mavutil.mavlink_connection('udpout:192.168.2.2:14570',source_system=1,source_component=1)
+ROVCp = mavutil.mavlink_connection('udpout:192.168.2.2:14570', source_system=1, source_component=1)
 
-# -------------------------------UTILITY FUNCTIONS-------------------------------
-#Function returns the most recent message of the designated msgType. 
+# -------------------------------SENSOR SETUP-------------------------------
+sDict = {
+    "CT.X2": -1,
+    "Chloro-blue": -1,
+    "Rhodamine": -1,
+    "Turbidity": -1,
+    "Dissolved Oxygen": -1
+}
+
+
+def sendCockpitValue(dest, name, sensorValue):
+    dest.mav.named_value_float_send(int((time.time() - boot_time) * 1e6), name.encode(), sensorValue)
+
 def getMessage(connection, msgType):
-	msg = None
-	while temp := connection.recv_match(type=msgType):
-		msg = temp
-	if msg == None:
-		msg = connection.recv_match(type=msgType, blocking = True)
-	return msg
+    msg = None
+    while temp := connection.recv_match(type=msgType):
+        msg = temp
+    if msg is None:
+        msg = connection.recv_match(type=msgType, blocking=True)
+    return msg
 
-#Sends a message of type "name" to the specific host with the sensor value. 
-def sendCockpitValue(dest,name,sensorValue):
-	dest.mav.named_value_float_send(int((time.time() - boot_time)*microSecToSec),name.encode(),sensorValue)
-
-#Parsing script for AML Conductivity / Temperature sensor.
-def getCTNums(serNum):
-	#Get a line from the sensor.
-	sensorLine = getSensorLine(serNum)
-	
-	#Parse it for the the specific values in said line.
-	splitLine = sensorLine.split()
-	sensorNums = [None] * 2
-	sensorNums[0] = int(float(splitLine[0])*1e5) #Conductivity Value.
-	writeToFile(splitLine[0],"Cond")
-	sensorNums[1] = int(float(splitLine[1])) #Temperature Value.
-	writeToFile(splitLine[1],"Temp")
-	return sensorNums
-
-#Function to pull a line from the sensor attached from the argument serial number.
 def getSensorLine(serNum):
-	#Initalize an empty buffer and an empty string.
-	line = []
-	fullLine = ""
-	#Wait for the end of the next line to start reading a line.
-	while serNum.read().decode("utf-8",errors='ignore')!='\n':
-		pass
-	#Read bytes in one at a time, the join and return the full line.
-	while True:
-		b = (serNum.read()).decode("utf-8",errors='ignore')
-		line.append(b)
-		if b =='\n':
-			fullLine = ''.join(line)
-			#print("Full line is: ",fullLine)
-			line = []
-			serNum.reset_input_buffer()
-			serNum.reset_output_buffer()
-			return fullLine
+    if not serNum or not serNum.is_open:
+        print("Attempted to read from closed or invalid serial port.")
+        return ""
+    try:
+        serNum.flushInput()
+        serNum.flushOutput()
+        while serNum.read().decode("utf-8", errors='ignore') != '\n':
+            pass
+        line = []
+        while True:
+            b = serNum.read().decode("utf-8", errors='ignore')
+            line.append(b)
+            if b == '\n':
+                serNum.reset_input_buffer()
+                serNum.reset_output_buffer()
+                return ''.join(line)
+    except serial.SerialException as e:
+        print(f"Serial error during read: {e}")
+        return ""
 
-#AML Turbidity implementation
-def getTurbVal(serNum):
-	#Get a line from the sensor.
-	sensorLine = getSensorLine(serNum)
-	writeToFile(sensorLine,"Turb")
-	#Parse it for the the specific values in said line.
-	return int(float(sensorLine))
+def getCTNums(sen):
+    sensorLine = getSensorLine(sDict[sen])
+    splitLine = sensorLine.split()
+    sensorNums = [None] * 2
+    sensorNums[0] = (float(splitLine[0]))
+    sensorNums[1] = (float(splitLine[1]))
+    return sensorNums
 
-#Helper function to check if any data is being transmitted accross the USB line.
-def waitForSensorResponse(ser, timeout=5):
-	#Wait for data from the sensor for up to timeout seconds.
-	ser.timeout = 0.5  # Read timeout (non-blocking)
-	start_time = time.time()
-	buffer = ''
+def getSingleVal(sen):
+    sensorLine = getSensorLine(sDict[sen])
+    try:
+        sensorVal = int(float(sensorLine))
+    except ValueError:
+        print(f"Error found in sensor line {sen}. Removing sensor.")
+        sDict[sen] = -1
+        sensorVal = -1
+    return sensorVal
 
-	while time.time() - start_time < timeout:
-		try:
-			line = ser.readline().decode('utf-8').strip()
-			if line:
-				return line
-		except Exception:
-			pass
-	return None  # No valid data received
-
-# -------------------------------SENSOR SET UP-------------------------------
-serial_connections = []
-timeout = 10  # seconds
+# --------------------------- DEVICE DISCOVERY -----------------------------
+timeout = 10
 start_time = time.time()
 
-usb_devices = []
-
-# Wait until USB devices are detected or timeout
 while time.time() - start_time < timeout:
-	usb_devices = glob.glob('/dev/ttyUSB*')
-	if usb_devices:
-		break
-	time.sleep(0.5)  # Check every 0.5 seconds
+    usb_devices = glob.glob('/dev/ttyUSB*')
+    if usb_devices:
+        break
+    time.sleep(0.5)
 
 if not usb_devices:
-	print("No USB devices detected after 10 seconds. Exiting.")
-	sys.exit(1)
+    print("No USB devices detected after 10 seconds. Exiting.")
+    sys.exit(1)
 
-# Proceed if USB devices found
 for dev in usb_devices:
-	try:
-		ser = serial.Serial(dev, 9600)
-		serial_connections.append(ser)
-		print(f"Connected to {dev}")
+    try:
+        print(f"Probing {dev}...")
+        ser = serial.Serial(dev, 9600, timeout=1)
+        time.sleep(0.5)
+        ser.write(b"\r")
+        time.sleep(1)
+        ser.write(b"display options\r")
 
-		line = waitForSensorResponse(ser)
+        start_time = time.time()
+        found = False
+        while time.time() - start_time < 5:
+            line = ser.readline().decode('utf-8', errors='ignore').strip()
+            if not line:
+                continue
+            for sName in sDict:
+                if sDict[sName] == -1 and sName in line:
+                    print(f"{sName} found on <{dev}>.")
+                    try:
+                        sDict[sName] = serial.Serial(dev, 9600, timeout=1)
+                        found = True
+                    except serial.SerialException as e:
+                        print(f"Could not reopen {dev} for {sName}: {e}")
+                        sDict[sName] = -1
+        ser.close()
+        if not found:
+            print(f"No matching sensor on {dev}. Closed.")
+    except serial.SerialException as e:
+        print(f"Failed to connect to {dev}: {e}")
 
-		if line is None:
-			print(f"No data received from {dev} after 5 seconds. Closing.")
-			ser.close()
-			continue  # Skip this device
-
-		if line.find(" ") != -1:
-			print("It's a CT sensor.")
-			CTSerial = ser
-		else:
-			print("It's not CT.")
-			TurbSerial = ser
-
-	except serial.SerialException as e:
-		print(f"Failed to connect to {dev}: {e}")
-
-#IMPROTANT: Need to ping the host first for the autopilot to accept the connection.
-#Conversion of time unit for timestamping.
-microSecToSec = 1e6
-ROVCp.mav.ping_send(int((time.time()-boot_time)*microSecToSec),0,0,0)
+# ------------------------- MAVLINK SETUP -----------------------------
+ROVCp.mav.ping_send(int((time.time() - boot_time) * 1e6), 0, 0, 0)
 time.sleep(1)
-#Wait for acknowledgement.
-msg = ROVCp.recv_match()
+ROVCp.recv_match()
 
-# -------------------------------SENSOR DATA LOGGING-------------------------------
-day = datetime.now()
-fileName= "/usr/blueos/userdata/sensorData/" + str(datetime.date(day))+".txt"
+fileName = f"/usr/blueos/userdata/sensorData/{datetime.now().date()}.txt"
 textBackup = open(fileName, "a")
+textBackup.write("Time, BAR30-Depth (m), BAR30-Temp (°C), AML Cond (mS/cm), AML Temp (°C),PSU (Calulated), AML Chloro (μg/L), AML Rho (ppb), AML Turb (NTU),  AML DO (μmol/L)\n")
+textLine = ""
+# ------------------------- MAIN LOOP -----------------------------
+try:
+    while True:
+        textLine = datetime.now().strftime("%H:%M:%S")
+        print(textLine)
+        bar30Val = getMessage(master, 'SCALED_PRESSURE2')
+        BAR30Depth = (bar30Val.press_abs - 1013)/100.558 #Converting from raw pressure (hPa) to meters.
+        BAR30Temp = (bar30Val.temperature)/100 #Convert from centi°C to  °C.
+        textLine += f",{BAR30Depth:.2f},{BAR30Temp:.2f}"
 
-def writeToFile(sensorData,dataType):
-	#Grab the current time and add it to the sensor line.
-	e = datetime.now()
-	messageString =str(time.time())+","+dataType+","+str(sensorData)
-	#Write contents to the backup textfile.
-	textBackup.write(messageString)
-	textBackup.write("\n")
+        for sen in sDict:
+            if sDict[sen] == -1:
+                sendCockpitValue(ROVCp, "AML" + sen, -1)
+                textLine +=",-1"
+                
+            elif sen == "CT.X2": #CT value hadling  + Salinity Calc.
+                sVal = getCTNums(sen)
+                #Calculate Salinity (PSU) from Conductivity (mS/cm), Temp (deg C), P (dbar).
+                #Send arguments as array elements.
+                hPa2dBar = 100 #Bar30 Pressure in hPa, SP calc in dBar; 1dBar = 100 hPa. 
+                salPSU = SPfromC([sVal[0]],[sVal[1]],[BAR30Depth*hPa2dBar]) #What's best way to error handle this?
+                print(f"CT value: {sVal}, Sal (PSU): {salPSU}")
+                textLine += f",{sVal[0]},{sVal[1]},{salPSU}"
+                sendCockpitValue(ROVCp, "AML COND", sVal[0])
+                sendCockpitValue(ROVCp, "AML TEMP", sVal[1])
+                sendCockpitValue(ROVCp, "PSU-CALC",salPSU)
 
-# -------------------------------MAIN FUNCTION-------------------------------
-while True:
-	CTVals = getCTNums(CTSerial)
-	TurbVal = getTurbVal(TurbSerial)
-	writeToFile(getMessage(master,'SCALED_PRESSURE2').press_abs,"Bar-Depth")
-	writeToFile(getMessage(master,'SCALED_PRESSURE2').temperature,"Bar-Temp")
-	#Print values to the terminal.
-	print("Turb: ",TurbVal)
-	print("CT: ",CTVals)
-	#Stream values to cockpit.
-	sendCockpitValue(ROVCp,"Cond",CTVals[0])
-	sendCockpitValue(ROVCp,"Temp",CTVals[1])
-	sendCockpitValue(ROVCp,"Turb",TurbVal)
+            
 
-	time.sleep(1)
+            else: #Case single value sensor.
+                sVal = getSingleVal(sen)
+                textLine += f",{sVal}"
+                print(f"{sen} value: {sVal}")
+                sendCockpitValue(ROVCp, "AML" + sen, sVal)
+        
+        print("\n")
+        textBackup.write(textLine + "\n")
+        time.sleep(2)
+
+except KeyboardInterrupt:
+    print("Exiting script...")
+
+finally:
+    textBackup.close()
+    for s in sDict.values():
+        if isinstance(s, serial.Serial) and s.is_open:
+            s.close()
