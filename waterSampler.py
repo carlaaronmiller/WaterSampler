@@ -1,6 +1,6 @@
 from pymavlink import mavutil
 from datetime import datetime
-from SPfromCPython import SPfromC
+from SPFromCPython import SP_from_C
 import time
 import serial
 import glob
@@ -19,8 +19,18 @@ sDict = {
     "Turbidity": -1,
     "Dissolved Oxygen": -1
 }
-
-
+#Power cycles the sensors on defined port to trip RC Switch to high.
+def powerCycleSensors():
+    RCSwitchPort = 7
+    switchPWMLow = 1000
+    switchPWMHigh = 1900
+    setServoCmd = 183
+    print("Powering off sensors.")
+    master.mav.command_long_send(1,1,setServoCmd,0,RCSwitchPort,switchPWMLow,0,0,0,0,0)
+    time.sleep(4)
+    print("Powering on sensors.")
+    master.mav.command_long_send(1,1,setServoCmd,0,RCSwitchPort,switchPWMHigh,0,0,0,0,0)
+    time.sleep(4)
 def sendCockpitValue(dest, name, sensorValue):
     dest.mav.named_value_float_send(int((time.time() - boot_time) * 1e6), name.encode(), sensorValue)
 
@@ -57,8 +67,8 @@ def getCTNums(sen):
     sensorLine = getSensorLine(sDict[sen])
     splitLine = sensorLine.split()
     sensorNums = [None] * 2
-    sensorNums[0] = (float(splitLine[0]))
-    sensorNums[1] = (float(splitLine[1]))
+    sensorNums[0] = (float(splitLine[0]))#C
+    sensorNums[1] = round((float(splitLine[1])),2)#T
     return sensorNums
 
 def getSingleVal(sen):
@@ -72,6 +82,8 @@ def getSingleVal(sen):
     return sensorVal
 
 # --------------------------- DEVICE DISCOVERY -----------------------------
+#Trigger the RC switch to give the sensors power.
+powerCycleSensors()
 timeout = 10
 start_time = time.time()
 
@@ -122,7 +134,7 @@ ROVCp.recv_match()
 
 fileName = f"/usr/blueos/userdata/sensorData/{datetime.now().date()}.txt"
 textBackup = open(fileName, "a")
-textBackup.write("Time, BAR30-Depth (m), BAR30-Temp (°C), AML Cond (mS/cm), AML Temp (°C),PSU (Calulated), AML Chloro (μg/L), AML Rho (ppb), AML Turb (NTU),  AML DO (μmol/L)\n")
+textBackup.write("Time, BAR30-Depth (m), BAR30-Temp (°C), AML Cond (mS/cm), AML Temp (°C), PSU (Calulated), AML Chloro (μg/L), AML Rho (ppb), AML Turb (NTU),  AML DO (μmol/L)\n")
 textLine = ""
 # ------------------------- MAIN LOOP -----------------------------
 try:
@@ -144,19 +156,19 @@ try:
                 #Calculate Salinity (PSU) from Conductivity (mS/cm), Temp (deg C), P (dbar).
                 #Send arguments as array elements.
                 hPa2dBar = 100 #Bar30 Pressure in hPa, SP calc in dBar; 1dBar = 100 hPa. 
-                salPSU = SPfromC([sVal[0]],[sVal[1]],[BAR30Depth*hPa2dBar]) #What's best way to error handle this?
-                print(f"CT value: {sVal}, Sal (PSU): {salPSU}")
+                salPSU = -1 if -1 in sVal else SP_from_C([sVal[0]],[sVal[1]],[BAR30Depth*hPa2dBar]) 
+                print(f"CT: {sVal}, Sal(PSU): {salPSU}")
                 textLine += f",{sVal[0]},{sVal[1]},{salPSU}"
-                sendCockpitValue(ROVCp, "AML COND", sVal[0])
-                sendCockpitValue(ROVCp, "AML TEMP", sVal[1])
-                sendCockpitValue(ROVCp, "PSU-CALC",salPSU)
+                sendCockpitValue(ROVCp, "AMLCond", sVal[0])
+                sendCockpitValue(ROVCp, "AMLTemp", sVal[1])
+                sendCockpitValue(ROVCp, "Sal-Calc",salPSU)
 
             
 
             else: #Case single value sensor.
                 sVal = getSingleVal(sen)
                 textLine += f",{sVal}"
-                print(f"{sen} value: {sVal}")
+                print(f"{sen}: {sVal}")
                 sendCockpitValue(ROVCp, "AML" + sen, sVal)
         
         print("\n")
