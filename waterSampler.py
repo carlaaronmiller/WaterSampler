@@ -27,10 +27,10 @@ def powerCycleSensors():
     setServoCmd = 183
     print("Powering off sensors.")
     master.mav.command_long_send(1,1,setServoCmd,0,RCSwitchPort,switchPWMLow,0,0,0,0,0)
-    time.sleep(4)
+    time.sleep(10)
     print("Powering on sensors.")
     master.mav.command_long_send(1,1,setServoCmd,0,RCSwitchPort,switchPWMHigh,0,0,0,0,0)
-    time.sleep(4)
+    time.sleep(10)
 def sendCockpitValue(dest, name, sensorValue):
     dest.mav.named_value_float_send(int((time.time() - boot_time) * 1e6), name.encode(), sensorValue)
 
@@ -112,18 +112,20 @@ for dev in usb_devices:
             line = ser.readline().decode('utf-8', errors='ignore').strip()
             if not line:
                 continue
+            
             for sName in sDict:
                 if sDict[sName] == -1 and sName in line:
                     print(f"{sName} found on <{dev}>.")
                     try:
-                        sDict[sName] = serial.Serial(dev, 9600, timeout=1)
+                        sDict[sName] = ser
                         found = True
                     except serial.SerialException as e:
                         print(f"Could not reopen {dev} for {sName}: {e}")
                         sDict[sName] = -1
-        ser.close()
+
         if not found:
             print(f"No matching sensor on {dev}. Closed.")
+            ser.close()
     except serial.SerialException as e:
         print(f"Failed to connect to {dev}: {e}")
 
