@@ -5,6 +5,7 @@ import time
 import serial
 import glob
 import sys
+#Version 1.0.0
 
 # -------------------------------CONNECTION SETUP-------------------------------
 master = mavutil.mavlink_connection('tcp:127.0.0.1:5777')
