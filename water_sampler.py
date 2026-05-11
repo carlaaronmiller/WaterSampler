@@ -1,23 +1,30 @@
 from pymavlink import mavutil
 from datetime import datetime
-from SPFromCPython import SP_from_C
+from SPFromC import SP_from_C
+from bluerobotics_navigator import navigator  # type: ignore
+from fastapi import FastAPI
+
+import uvicorn
+import asyncio
 import time
 import serial
 import glob
 import sys
+import ms5837
 
 # -------------------------------MAV CMD PARAMS-------------------------------
 RC_SWITCH_PORT = 7
 PWM_LOW = 1000
 PWM_HIGH = 1900
-SET_SERVO_CMD_ID = 183
+SERVO_PWM_FREQUENCY_HZ = 50
+MAV_CMD_DO_REPEAT_SERVO_ID = 183
 TARGET_SYSTEM = 1
 TARGET_COMPONENT = 1
 CONFIRMATION = 0
 UNUSED_PARAM = 0
 MAVLINK_PAUSE_TIME_SECONDS = 1
-# -------------------------------MAIN FUNCTION PARAMS-------------------------------
-REFRESH_PERIOD_SECONDS = 2
+# -------------------------------AML LOOP PARAMS-------------------------------
+REFRESH_PERIOD_SECONDS = 1
 NO_DATA_VAL = -1
 SENSOR_ERROR_VAL = -2
 TEXT_BACKUP_HEADER = "Time, BAR30-Depth (m), BAR30-Temp (°C), AML Cond (mS/cm), AML Temp (°C), PSU (Calulated), AML Chloro (μg/L), AML Rho (ppb), AML Turb (NTU),  AML DO (μmol/L)\n"
@@ -29,98 +36,39 @@ SALTWATER_DENSITY_KGM3 = 1023.6
 SEC_TO_MICROSEC = 1e6
 HPA_TO_PA = 100
 HPA_TO_BAR = 100
+MBAR_TO_BAR = 1000
 # -------------------------------CONNECTION SETUP-------------------------------
 MASTER_CONN = mavutil.mavlink_connection("tcp:127.0.0.1:5777")
 BOOT_TIME = time.time()
 ROV_COCKPIT_ADDRESS = "udpout:192.168.2.2:14570"
-# -------------------------------SENSOR SETUP-------------------------------
-SENSOR_DICT = {"CT.X2": None, "Chloro-blue": None, "Rhodamine": None, "Turbidity": None, "Dissolved Oxygen": None}
+# -------------------------------SENSOR COMM PARAMS-------------------------------
+SENSOR_DICT = {
+    "CT.X2": None,
+    "Chloro-blue": None,
+    "Rhodamine": None,
+    "Turbidity": None,
+    "Dissolved Oxygen": None,
+}
 SENSOR_BAUD_RATE = 9600
-SENSOR_REBOOT_TIME_SECONDS = 10  # Healthy amount of time from power to actually streaming data.
+SENSOR_REBOOT_TIME_SECONDS = (
+    10  # Healthy amount of time from power to actually streaming data.
+)
 SENSOR_CMD_WAIT_TIME_SECONDS = 1  # Give sensors time to respond to the cmd.
-SENSOR_RESPONSE_TIMEOUT_SECONDS = 5  # If nothing after this amount of time, nothings coming.
+SENSOR_RESPONSE_TIMEOUT_SECONDS = (
+    5  # If nothing after this amount of time, nothings coming.
+)
+MS5837_BUS = 6
+BAR30_REFRESH_PERIOD_SECONDS = 0.25
 
 
 # -------------------------------FUNCTIONS-------------------------------
 def power_cycle_sensors():  # Power cycles the sensors on defined port to trip RC Switch to high.
     print("Powering off sensors.")
-    MASTER_CONN.mav.command_long_send(
-        TARGET_SYSTEM,
-        TARGET_COMPONENT,
-        SET_SERVO_CMD_ID,
-        CONFIRMATION,
-        RC_SWITCH_PORT,
-        PWM_LOW,
-        UNUSED_PARAM,
-        UNUSED_PARAM,
-        UNUSED_PARAM,
-        UNUSED_PARAM,
-        UNUSED_PARAM,
-    )
+    navigator.swt_pwm_channel_value(RC_SWITCH_PORT, PWM_LOW)
     time.sleep(SENSOR_REBOOT_TIME_SECONDS)
     print("Powering on sensors.")
-    MASTER_CONN.mav.command_long_send(
-        TARGET_SYSTEM,
-        TARGET_COMPONENT,
-        SET_SERVO_CMD_ID,
-        CONFIRMATION,
-        RC_SWITCH_PORT,
-        PWM_HIGH,
-        UNUSED_PARAM,
-        UNUSED_PARAM,
-        UNUSED_PARAM,
-        UNUSED_PARAM,
-        UNUSED_PARAM,
-    )
+    navigator.swt_pwm_channel_value(RC_SWITCH_PORT, PWM_HIGH)
     time.sleep(SENSOR_REBOOT_TIME_SECONDS)
-
-
-def send_cockpit_value(dest, name, sensor_value):
-    dest.mav.named_value_float_send(int((time.time() - BOOT_TIME) * SEC_TO_MICROSEC), name.encode(), sensor_value)
-
-
-def get_message(mavlink_conn, msg_type):
-    msg = None
-    while temp := mavlink_conn.recv_match(type=msg_type):
-        msg = temp
-    if msg is None:
-        msg = mavlink_conn.recv_match(type=msg_type, blocking=True)
-    return msg
-
-
-def get_sensor_line(ser_num):
-    if not ser_num or not ser_num.is_open:
-        print("Attempted to read from closed or invalid serial port.")
-        return ""
-    try:
-        ser_num.flushInput()
-        ser_num.flushOutput()
-        ser_num.readline()  # discard partial/incomplete line
-        return ser_num.readline().decode("utf-8", errors="ignore").strip()
-    except serial.SerialException as e:
-        print(f"Serial error during read: {e}")
-        return ""
-
-
-def get_ct_nums(sen):
-    sensor_line = get_sensor_line(SENSOR_DICT[sen])
-    split_line = sensor_line.split()
-    ct_vals = [None] * 2
-    if len(split_line) < 2:
-        print(f"Unexpected sensor output for {sen}: '{sensor_line}'. Expected at least 2 values.")
-        return [SENSOR_ERROR_VAL, SENSOR_ERROR_VAL]
-    ct_vals[0] = float(split_line[0])  # C
-    ct_vals[1] = round((float(split_line[1])), 2)  # T
-    return ct_vals
-
-
-def get_single_val(sen):
-    sensor_line = get_sensor_line(SENSOR_DICT[sen])
-    try:
-        sensor_val = int(float(sensor_line))
-    except ValueError:
-        sensor_val = SENSOR_ERROR_VAL
-    return sensor_val
 
 
 def discover_devices():
@@ -134,13 +82,17 @@ def discover_devices():
         time.sleep(SENSOR_CMD_WAIT_TIME_SECONDS)
 
     if not usb_devices:
-        print(f"No USB devices detected after {SENSOR_RESPONSE_TIMEOUT_SECONDS} seconds. Exiting.")
+        print(
+            f"No USB devices detected after {SENSOR_RESPONSE_TIMEOUT_SECONDS} seconds. Exiting."
+        )
         sys.exit(1)
 
     for dev in usb_devices:
         try:
             print(f"Probing {dev}...")
-            ser = serial.Serial(dev, SENSOR_BAUD_RATE, timeout=SENSOR_CMD_WAIT_TIME_SECONDS)
+            ser = serial.Serial(
+                dev, SENSOR_BAUD_RATE, timeout=SENSOR_CMD_WAIT_TIME_SECONDS
+            )
             time.sleep(SENSOR_CMD_WAIT_TIME_SECONDS)
             ser.write(b"\r")
             time.sleep(SENSOR_CMD_WAIT_TIME_SECONDS)
@@ -168,10 +120,72 @@ def discover_devices():
     return SENSOR_DICT
 
 
+def get_sensor_line(ser_num):
+    if not ser_num or not ser_num.is_open:
+        print("Attempted to read from closed or invalid serial port.")
+        return ""
+    try:
+        ser_num.flushInput()
+        ser_num.flushOutput()
+        ser_num.readline()  # discard partial/incomplete line
+        return ser_num.readline().decode("utf-8", errors="ignore").strip()
+    except serial.SerialException as e:
+        print(f"Serial error during read: {e}")
+        return ""
+
+
+def get_ct_nums(sen):
+    sensor_line = get_sensor_line(SENSOR_DICT[sen])
+    split_line = sensor_line.split()
+    ct_vals = [None] * 2
+    if len(split_line) < 2:
+        print(
+            f"Unexpected sensor output for {sen}: '{sensor_line}'. Expected at least 2 values."
+        )
+        return [SENSOR_ERROR_VAL, SENSOR_ERROR_VAL]
+    ct_vals[0] = float(split_line[0])  # C
+    ct_vals[1] = round((float(split_line[1])), 2)  # T
+    return ct_vals
+
+
+def get_single_val(sen):
+    sensor_line = get_sensor_line(SENSOR_DICT[sen])
+    try:
+        sensor_val = int(float(sensor_line))
+    except ValueError:
+        sensor_val = SENSOR_ERROR_VAL
+    return sensor_val
+
+
+def send_cockpit_value(dest, name, sensor_value):
+    dest.mav.named_value_float_send(
+        int((time.time() - BOOT_TIME) * SEC_TO_MICROSEC), name.encode(), sensor_value
+    )
+
+
+def get_message(mavlink_conn, msg_type):
+    msg = None
+    while temp := mavlink_conn.recv_match(type=msg_type):
+        msg = temp
+    if msg is None:
+        msg = mavlink_conn.recv_match(type=msg_type, blocking=True)
+    return msg
+
+
+def write_pwm(pwm_channel, pwm_value):
+    navigator.swt_pwm_channel_value(pwm_channel, pwm_value)
+    print(f"Set PWM channel {pwm_channel} to value {pwm_value}.")
+
+
 def setup_cockpit_conn(address):
-    rov_cockpit_conn = mavutil.mavlink_connection(address, source_system=1, source_component=1)
+    rov_cockpit_conn = mavutil.mavlink_connection(
+        address, source_system=1, source_component=1
+    )
     rov_cockpit_conn.mav.ping_send(
-        int((time.time() - BOOT_TIME) * SEC_TO_MICROSEC), UNUSED_PARAM, UNUSED_PARAM, UNUSED_PARAM
+        int((time.time() - BOOT_TIME) * SEC_TO_MICROSEC),
+        UNUSED_PARAM,
+        UNUSED_PARAM,
+        UNUSED_PARAM,
     )
     time.sleep(MAVLINK_PAUSE_TIME_SECONDS)
     rov_cockpit_conn.recv_match()
@@ -192,25 +206,55 @@ def write_to_backup(file, line):
         print(f"Error writing to backup file: {e}")
 
 
-# ------------------------- MAIN LOOP -----------------------------
-if __name__ == "__main__":
+# Depth Sensor reading loop:
+bar30_depth = 0.0  # Global variables to pass between depth and main loop. Updated by depth sensor loop, read by main.
+bar30_temp = 0.0
+bar30_mbar = 0.0
+
+
+async def depth_sensor_loop():
+    global bar30_depth, bar30_temp, bar30_mbar
+    bar30 = ms5837.MS5837_30BA(bus=MS5837_BUS)
+    bar30.setFluidDensity(
+        SALTWATER_DENSITY_KGM3
+    )  # Set density for seawater, if using freshwater comment out or change.
+    bar30.init()
+    while True:
+        if bar30.read():
+            bar30_depth = round(bar30.depth(), 2)
+            bar30_temp = round(bar30.temperature(), 2)
+            bar30_mbar = round(bar30.pressure(), 3)
+            send_cockpit_value(MASTER_CONN, "BAR30-Depth", bar30_depth)
+            send_cockpit_value(MASTER_CONN, "BAR30-Temp", bar30_temp)
+            print(f"Current Depth: {bar30_depth:.2f} m")
+            print(f"Current Temperature: {bar30_temp:.2f} * °C")
+        else:
+            print("Failed to read BAR30.")
+        await asyncio.sleep(BAR30_REFRESH_PERIOD_SECONDS)
+
+
+app = FastAPI()
+
+
+@app.post("/trigger_sample")
+async def trigger_sample(channel: int, duration: int):
+    navigator.set_pwm_channel_value(channel, 1900)
+    await asyncio.sleep(duration)  # non-blocking
+    navigator.set_pwm_channel_value(channel, 1100)
+    return {"status": "done"}
+
+
+async def aml_parsing_loop():
     sen_dict = discover_devices()
     rov_cockpit_conn = setup_cockpit_conn(ROV_COCKPIT_ADDRESS)
     text_backup = setup_text_backup()
     text_line = ""
-
+    # ------------------------- MAIN LOOP -----------------------------
     try:
         while True:
             text_line = datetime.now().strftime("%H:%M:%S")
             print(text_line)
-            BAR30_val = get_message(MASTER_CONN, "SCALED_PRESSURE2")
-            BAR30_depth = (
-                (BAR30_val.press_abs - STANDARD_ATMOSPHERIC_PRESSURE_HPA)
-                * HPA_TO_PA
-                / (SALTWATER_DENSITY_KGM3 * GRAV_ACC)
-            )  # Converting from raw pressure (hPa) to meters.
-            BAR30_temp = (BAR30_val.temperature) * DEG_C_PER_DEG_CENTI_C  # Convert from centi°C to  °C.
-            text_line += f",{BAR30_depth:.2f},{BAR30_temp:.2f}"
+            text_line += f",{bar30_depth:.2f},{bar30_temp:.2f}"
 
             for sen in sen_dict:
                 if sen_dict[sen] is None:
@@ -224,7 +268,9 @@ if __name__ == "__main__":
                     sal_psu = (
                         NO_DATA_VAL
                         if SENSOR_ERROR_VAL in s_val
-                        else SP_from_C([s_val[0]], [s_val[1]], [BAR30_depth * HPA_TO_BAR])
+                        else SP_from_C(
+                            [s_val[0]], [s_val[1]], [bar30_mbar * MBAR_TO_BAR]
+                        )
                     )
                     print(f"CT: {s_val}, Sal(PSU): {sal_psu}")
                     text_line += f",{s_val[0]},{s_val[1]},{sal_psu}"
@@ -244,13 +290,24 @@ if __name__ == "__main__":
 
             print("\n")
             write_to_backup(text_backup, text_line)
-            time.sleep(REFRESH_PERIOD_SECONDS)
-
-    except KeyboardInterrupt:
-        print("Exiting script...")
-
+            await asyncio.sleep(REFRESH_PERIOD_SECONDS)
     finally:
-        text_backup.close()
+        if text_backup:
+            text_backup.close()
         for s in SENSOR_DICT.values():
             if isinstance(s, serial.Serial) and s.is_open:
                 s.close()
+
+
+async def start_async_functions():
+    # Initial setup for navigator RC switch.
+    navigator.init()
+    navigator.set_pwm_frequency(SERVO_PWM_FREQUENCY_HZ)
+    navigator.set_pwm_enable(True)
+    config = uvicorn.Config(app, host="0.0.0.0", port=8000, loop="asyncio")
+    server = uvicorn.Server(config)
+    await asyncio.gather(depth_sensor_loop(), aml_parsing_loop(), server.serve())
+
+
+if __name__ == "__main__":
+    asyncio.run(start_async_functions())
