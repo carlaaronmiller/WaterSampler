@@ -4,3 +4,4 @@ bluerobotics_navigator==0.1.2
 uvicorn==0.39.0
 numpy==2.0.2
 fastapi==0.128.8
+smbus2==0.6.1
