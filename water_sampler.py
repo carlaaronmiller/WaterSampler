@@ -1,7 +1,7 @@
 from pymavlink import mavutil
 from datetime import datetime
 from SPFromC import SP_from_C
-import bluerobotics_navigator as navigator  # type: ignore
+import bluerobotics_navigator as navigator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
