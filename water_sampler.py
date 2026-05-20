@@ -1,8 +1,9 @@
 from pymavlink import mavutil
 from datetime import datetime
 from SPFromC import SP_from_C
-from bluerobotics_navigator import navigator  # type: ignore
+import bluerobotics_navigator as navigator  # type: ignore
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 import uvicorn
 import asyncio
@@ -11,11 +12,15 @@ import serial
 import glob
 import sys
 import ms5837
-
+import requests
 # -------------------------------MAV CMD PARAMS-------------------------------
-RC_SWITCH_PORT = 7
-PWM_LOW = 1000
-PWM_HIGH = 1900
+SENSOR_PWR_RELAY_CHANNEL = 6 # Zero indexed, physical port 7.
+SAMPLE_TRIGGER_CHANNEL = 1 # physical port 2.
+RELAY_ON = 1.0
+RELAY_OFF = 0
+PWM_LOW = 225  # PWM values not in microsecond, but as fraction of 4096 block to reach standard 1100, 1500, and 1900 periods.
+PWM_MID = 307
+PWM_HIGH = 389
 SERVO_PWM_FREQUENCY_HZ = 50
 MAV_CMD_DO_REPEAT_SERVO_ID = 183
 TARGET_SYSTEM = 1
@@ -23,6 +28,7 @@ TARGET_COMPONENT = 1
 CONFIRMATION = 0
 UNUSED_PARAM = 0
 MAVLINK_PAUSE_TIME_SECONDS = 1
+RELAY_PAUSE_TIME_SECONDS = 2
 # -------------------------------AML LOOP PARAMS-------------------------------
 REFRESH_PERIOD_SECONDS = 1
 NO_DATA_VAL = -1
@@ -37,10 +43,11 @@ SEC_TO_MICROSEC = 1e6
 HPA_TO_PA = 100
 HPA_TO_BAR = 100
 MBAR_TO_BAR = 1000
+MINIMUM_SALT_WATER_COND = 30 # mS/cm
 # -------------------------------CONNECTION SETUP-------------------------------
-MASTER_CONN = mavutil.mavlink_connection("tcp:127.0.0.1:5777")
+MASTER_ADDRESS = "tcp:127.0.0.1:5777"
 BOOT_TIME = time.time()
-ROV_COCKPIT_ADDRESS = "udpout:192.168.2.2:14570"
+
 # -------------------------------SENSOR COMM PARAMS-------------------------------
 SENSOR_DICT = {
     "CT.X2": None,
@@ -59,20 +66,21 @@ SENSOR_RESPONSE_TIMEOUT_SECONDS = (
 )
 MS5837_BUS = 6
 BAR30_REFRESH_PERIOD_SECONDS = 0.25
-
+DEPTH_SENSOR_PRINT_PERIOD = 1.0
+AUTOPILOT_SHUTDOWN_SECONDS = 5
 
 # -------------------------------FUNCTIONS-------------------------------
 def power_cycle_sensors():  # Power cycles the sensors on defined port to trip RC Switch to high.
     print("Powering off sensors.")
-    navigator.swt_pwm_channel_value(RC_SWITCH_PORT, PWM_LOW)
+    navigator.set_pwm_channel_value(SENSOR_PWR_RELAY_CHANNEL, PWM_LOW)
     time.sleep(SENSOR_REBOOT_TIME_SECONDS)
     print("Powering on sensors.")
-    navigator.swt_pwm_channel_value(RC_SWITCH_PORT, PWM_HIGH)
+    navigator.set_pwm_channel_value(SENSOR_PWR_RELAY_CHANNEL, PWM_HIGH)
     time.sleep(SENSOR_REBOOT_TIME_SECONDS)
 
 
 def discover_devices():
-    power_cycle_sensors()  # Trigger the RC switch to give the sensors power.
+    #power_cycle_sensors()  # Trigger the RC switch to give the sensors power.
     start_time = time.time()
 
     while time.time() - start_time < SENSOR_RESPONSE_TIMEOUT_SECONDS:
@@ -109,6 +117,7 @@ def discover_devices():
                         print(f"{s_name} found on <{dev}>.")
                         SENSOR_DICT[s_name] = ser
                         found = True
+                        time.sleep(SENSOR_REBOOT_TIME_SECONDS) #Give the sensor time to break out of menu.
 
             if not found:
                 print(f"No matching sensor on {dev}. Closed.")
@@ -121,6 +130,7 @@ def discover_devices():
 
 
 def get_sensor_line(ser_num):
+    
     if not ser_num or not ser_num.is_open:
         print("Attempted to read from closed or invalid serial port.")
         return ""
@@ -153,14 +163,10 @@ def get_single_val(sen):
     try:
         sensor_val = int(float(sensor_line))
     except ValueError:
+        print(f"{sen} bad line -> {sensor_line!r}") 
         sensor_val = SENSOR_ERROR_VAL
     return sensor_val
 
-
-def send_cockpit_value(dest, name, sensor_value):
-    dest.mav.named_value_float_send(
-        int((time.time() - BOOT_TIME) * SEC_TO_MICROSEC), name.encode(), sensor_value
-    )
 
 
 def get_message(mavlink_conn, msg_type):
@@ -170,26 +176,6 @@ def get_message(mavlink_conn, msg_type):
     if msg is None:
         msg = mavlink_conn.recv_match(type=msg_type, blocking=True)
     return msg
-
-
-def write_pwm(pwm_channel, pwm_value):
-    navigator.swt_pwm_channel_value(pwm_channel, pwm_value)
-    print(f"Set PWM channel {pwm_channel} to value {pwm_value}.")
-
-
-def setup_cockpit_conn(address):
-    rov_cockpit_conn = mavutil.mavlink_connection(
-        address, source_system=1, source_component=1
-    )
-    rov_cockpit_conn.mav.ping_send(
-        int((time.time() - BOOT_TIME) * SEC_TO_MICROSEC),
-        UNUSED_PARAM,
-        UNUSED_PARAM,
-        UNUSED_PARAM,
-    )
-    time.sleep(MAVLINK_PAUSE_TIME_SECONDS)
-    rov_cockpit_conn.recv_match()
-    return rov_cockpit_conn
 
 
 def setup_text_backup():
@@ -207,10 +193,18 @@ def write_to_backup(file, line):
 
 
 # Depth Sensor reading loop:
-bar30_depth = 0.0  # Global variables to pass between depth and main loop. Updated by depth sensor loop, read by main.
+bar30_depth = 0.0  # Global variables to pass between different loops.
 bar30_temp = 0.0
 bar30_mbar = 0.0
-
+sal_psu = 0.0
+aml_values = {
+    "CT.X2": {"cond": -1.0, "temp": -1.0},
+    "Chloro-blue": -1,
+    "Rhodamine": -1,
+    "Turbidity": -1,
+    "Dissolved Oxygen": -1,
+}
+text_backup = None
 
 async def depth_sensor_loop():
     global bar30_depth, bar30_temp, bar30_mbar
@@ -219,34 +213,65 @@ async def depth_sensor_loop():
         SALTWATER_DENSITY_KGM3
     )  # Set density for seawater, if using freshwater comment out or change.
     bar30.init()
+    last_print = 0
     while True:
         if bar30.read():
             bar30_depth = round(bar30.depth(), 2)
             bar30_temp = round(bar30.temperature(), 2)
             bar30_mbar = round(bar30.pressure(), 3)
-            send_cockpit_value(MASTER_CONN, "BAR30-Depth", bar30_depth)
-            send_cockpit_value(MASTER_CONN, "BAR30-Temp", bar30_temp)
-            print(f"Current Depth: {bar30_depth:.2f} m")
-            print(f"Current Temperature: {bar30_temp:.2f} * °C")
+            if time.time() - last_print >= DEPTH_SENSOR_PRINT_PERIOD:
+                print(f"Current Depth: {bar30_depth:.2f} m")
+                print(f"Current Temperature: {bar30_temp:.2f} °C")
+                last_print = time.time()
         else:
             print("Failed to read BAR30.")
         await asyncio.sleep(BAR30_REFRESH_PERIOD_SECONDS)
 
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.post("/trigger_sample")
-async def trigger_sample(channel: int, duration: int):
-    navigator.set_pwm_channel_value(channel, 1900)
-    await asyncio.sleep(duration)  # non-blocking
-    navigator.set_pwm_channel_value(channel, 1100)
-    return {"status": "done"}
+async def trigger_sample():
+    global text_backup
+    print("Triggering sample.")
+    navigator.set_pwm_channel_duty_cycle(SAMPLE_TRIGGER_CHANNEL,RELAY_OFF)
+    await asyncio.sleep(RELAY_PAUSE_TIME_SECONDS)  # non-blocking
+    navigator.set_pwm_channel_duty_cycle(SAMPLE_TRIGGER_CHANNEL,RELAY_ON)
 
+    if text_backup:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        text_backup.write(f"{timestamp}, SAMPLE TRIGGERED, depth={bar30_depth:.2f}, temp={bar30_temp:.2f}\n")
+        text_backup.flush()
+    
+    return {"status": "done", "depth": bar30_depth, "temp": bar30_temp}
+
+@app.get("/sensor_data")
+async def sensor_data():
+    flat_aml = {}
+    for key, val in aml_values.items():
+        if isinstance(val, dict):
+            for subkey, subval in val.items():
+                flat_aml[f"{key}_{subkey}"] = subval
+        else:
+            flat_aml[key] = val
+    return {
+        "depth": bar30_depth,
+        "temp": bar30_temp,
+        "pressure_mbar": bar30_mbar,
+        "sal_calc": sal_psu,
+        "aml": flat_aml,
+    }
 
 async def aml_parsing_loop():
+    global text_backup, aml_values, sal_psu
     sen_dict = discover_devices()
-    rov_cockpit_conn = setup_cockpit_conn(ROV_COCKPIT_ADDRESS)
     text_backup = setup_text_backup()
     text_line = ""
     # ------------------------- MAIN LOOP -----------------------------
@@ -258,35 +283,37 @@ async def aml_parsing_loop():
 
             for sen in sen_dict:
                 if sen_dict[sen] is None:
-                    send_cockpit_value(rov_cockpit_conn, "AML" + sen, NO_DATA_VAL)
+
                     text_line += f", {NO_DATA_VAL}"
 
                 elif sen == "CT.X2":  # CT value handling  + Salinity Calc.
                     s_val = get_ct_nums(
                         sen
                     )  # Calculate Salinity (PSU) from Conductivity (mS/cm), Temp (deg C), P (bar).
+                    aml_values["CT.X2"] = {"cond": s_val[0], "temp": s_val[1]}
                     sal_psu = (
                         NO_DATA_VAL
-                        if SENSOR_ERROR_VAL in s_val
+                        if SENSOR_ERROR_VAL in s_val or s_val[0]<MINIMUM_SALT_WATER_COND
                         else SP_from_C(
                             [s_val[0]], [s_val[1]], [bar30_mbar * MBAR_TO_BAR]
                         )
                     )
+
                     print(f"CT: {s_val}, Sal(PSU): {sal_psu}")
                     text_line += f",{s_val[0]},{s_val[1]},{sal_psu}"
-                    send_cockpit_value(rov_cockpit_conn, "AML-Cond", s_val[0])
-                    send_cockpit_value(rov_cockpit_conn, "AML-Temp", s_val[1])
-                    send_cockpit_value(rov_cockpit_conn, "Sal-Calc", sal_psu)
 
                 else:  # Case single value sensor.
                     s_val = get_single_val(sen)
-                    if s_val == NO_DATA_VAL or s_val == SENSOR_ERROR_VAL:
+                    if s_val == SENSOR_ERROR_VAL:
                         print(f"Error found in sensor line {sen}. Removing sensor.")
                         SENSOR_DICT[sen] = None
+                    elif s_val == NO_DATA_VAL:
+                        print(f"No data received from {sen}. Removing sensor.")
+                        SENSOR_DICT[sen] = None
                     else:
+                        aml_values[sen] = s_val
                         text_line += f",{s_val}"
                         print(f"{sen}: {s_val}")
-                        send_cockpit_value(rov_cockpit_conn, "AML" + sen, s_val)
 
             print("\n")
             write_to_backup(text_backup, text_line)
@@ -300,13 +327,33 @@ async def aml_parsing_loop():
 
 
 async def start_async_functions():
+    # Kill ardupilot on startup — we don't need it
+    try:
+        r = requests.post("http://localhost/ardupilot-manager/v1.0/stop")
+        print(f"Stopped ardupilot: {r.status_code}")
+    except Exception as e:
+        print(f"Ardupilot stop failed (may already be stopped): {e}")
+    await asyncio.sleep(AUTOPILOT_SHUTDOWN_SECONDS) 
     # Initial setup for navigator RC switch.
     navigator.init()
-    navigator.set_pwm_frequency(SERVO_PWM_FREQUENCY_HZ)
+    navigator.set_pwm_freq_hz(SERVO_PWM_FREQUENCY_HZ)
+    navigator.set_pwm_channel_value(SENSOR_PWR_RELAY_CHANNEL, PWM_HIGH)
+    navigator.set_pwm_channel_duty_cycle(SAMPLE_TRIGGER_CHANNEL, 1.0)
     navigator.set_pwm_enable(True)
-    config = uvicorn.Config(app, host="0.0.0.0", port=8000, loop="asyncio")
+
+    config = uvicorn.Config(app, host="0.0.0.0", port=9050, loop="asyncio")
     server = uvicorn.Server(config)
-    await asyncio.gather(depth_sensor_loop(), aml_parsing_loop(), server.serve())
+
+    depth_task = asyncio.create_task(depth_sensor_loop())
+    aml_task = asyncio.create_task(aml_parsing_loop())
+
+    try:
+        await server.serve()          # returns when uvicorn catches SIGINT/SIGTERM
+    finally:
+        depth_task.cancel()
+        aml_task.cancel()
+        await asyncio.gather(depth_task, aml_task, return_exceptions=True)
+        navigator.set_pwm_enable(False)   # leave the HAT in a known state
 
 
 if __name__ == "__main__":
